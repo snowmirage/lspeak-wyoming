@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""lspeak-server: OpenAI-compatible TTS HTTP server wrapping Wyoming XTTS.
+
+Exposes POST /v1/audio/speech for use with Open WebUI and other
+OpenAI-compatible TTS clients. Translates requests to Wyoming protocol
+and returns WAV audio from wyoming-xtts.
+
+Usage:
+    pip install fastapi uvicorn
+    ./lspeak-server                    # default: 0.0.0.0:8820
+    ./lspeak-server --port 9000        # custom port
+    WYOMING_HOST=10.2.0.123 ./lspeak-server  # custom Wyoming host
+"""
+
+import argparse
+import asyncio
+import json
+import os
+import struct
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
+from pydantic import BaseModel
+
+WYOMING_HOST = os.getenv("WYOMING_HOST", "10.2.0.123")
+WYOMING_PORT = int(os.getenv("WYOMING_PORT", "10200"))
+
+app = FastAPI(title="lspeak-server", description="OpenAI-compatible TTS via Wyoming XTTS")
+
+
+class SpeechRequest(BaseModel):
+    model: str = "xtts"
+    input: str
+    voice: str = "jarvis"
+    response_format: str = "wav"
+    speed: float = 1.0
+
+
+def build_wav(pcm_data: bytes, rate: int, width: int, channels: int) -> bytes:
+    data_size = len(pcm_data)
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF", 36 + data_size, b"WAVE", b"fmt ", 16, 1,
+        channels, rate, rate * channels * width, channels * width,
+        width * 8, b"data", data_size,
+    )
+    return header + pcm_data
+
+
+async def read_event(reader) -> tuple[dict, bytes] | None:
+    line = await asyncio.wait_for(reader.readline(), timeout=120.0)
+    if not line:
+        return None
+    header = json.loads(line)
+    data = {}
+    if header.get("data_length", 0) > 0:
+        data = json.loads(await reader.readexactly(header["data_length"]))
+    payload = b""
+    if header.get("payload_length", 0) > 0:
+        payload = await reader.readexactly(header["payload_length"])
+    header["data"] = data
+    return header, payload
+
+
+async def synthesize(text: str, voice: str = "jarvis") -> bytes | None:
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(WYOMING_HOST, WYOMING_PORT),
+            timeout=5.0,
+        )
+    except (OSError, asyncio.TimeoutError) as e:
+        raise HTTPException(status_code=503, detail=f"Wyoming TTS unavailable: {e}")
+
+    data_obj = {"text": text, "voice": {"name": voice}, "language": "en"}
+    data_bytes = json.dumps(data_obj).encode()
+    header = {
+        "type": "synthesize",
+        "version": "1.8.0",
+        "data_length": len(data_bytes),
+        "payload_length": 0,
+    }
+    writer.write(json.dumps(header).encode() + b"\n" + data_bytes)
+    await writer.drain()
+
+    rate, width, channels = 22050, 2, 1
+    pcm_chunks: list[bytes] = []
+
+    try:
+        while True:
+            result = await read_event(reader)
+            if result is None:
+                break
+            evt_header, payload = result
+            evt_type = evt_header.get("type", "")
+            if evt_type == "audio-start":
+                data = evt_header.get("data", {})
+                rate = data.get("rate", rate)
+                width = data.get("width", width)
+                channels = data.get("channels", channels)
+            elif evt_type == "audio-chunk":
+                if payload:
+                    pcm_chunks.append(payload)
+            elif evt_type == "audio-stop":
+                break
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Wyoming TTS timed out")
+    finally:
+        writer.close()
+
+    if not pcm_chunks:
+        raise HTTPException(status_code=500, detail="No audio returned from TTS")
+
+    return build_wav(b"".join(pcm_chunks), rate, width, channels)
+
+
+@app.post("/v1/audio/speech")
+async def create_speech(request: SpeechRequest):
+    if not request.input.strip():
+        raise HTTPException(status_code=400, detail="Input text is empty")
+
+    wav_bytes = await synthesize(request.input, request.voice)
+    return Response(content=wav_bytes, media_type="audio/wav")
+
+
+@app.get("/v1/audio/speech/voices")
+async def list_voices():
+    return {"voices": [{"name": "jarvis", "description": "XTTS v2 fine-tuned Jarvis"}]}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "wyoming_host": WYOMING_HOST, "wyoming_port": WYOMING_PORT}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    parser = argparse.ArgumentParser(description="lspeak-server: OpenAI-compatible TTS")
+    parser.add_argument("--host", default="0.0.0.0", help="Bind address")
+    parser.add_argument("--port", type=int, default=8820, help="Listen port")
+    args = parser.parse_args()
+
+    print(f"lspeak-server starting on {args.host}:{args.port}")
+    print(f"Wyoming TTS: {WYOMING_HOST}:{WYOMING_PORT}")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
