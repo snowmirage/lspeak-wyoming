@@ -13,7 +13,6 @@ Usage:
 
 import argparse
 import asyncio
-import io
 import struct
 import subprocess
 import sys
@@ -115,7 +114,7 @@ async def synthesize(text: str) -> bytes | None:
 
 
 def play_wav(wav_bytes: bytes):
-    """Play WAV audio using aplay (Linux) or available player."""
+    """Play WAV audio via aplay (ALSA)."""
     try:
         proc = subprocess.Popen(
             ["aplay", "-q", "-"],
@@ -124,20 +123,8 @@ def play_wav(wav_bytes: bytes):
         )
         proc.communicate(input=wav_bytes)
     except FileNotFoundError:
-        # Fallback: write to temp file and use paplay/ffplay
-        import tempfile
-
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
-            f.write(wav_bytes)
-            f.flush()
-            for player in ["paplay", "ffplay -nodisp -autoexit"]:
-                try:
-                    subprocess.run(player.split() + [f.name], check=True,
-                                   stderr=subprocess.DEVNULL)
-                    return
-                except (FileNotFoundError, subprocess.CalledProcessError):
-                    continue
-        print("lspeak-wyoming: no audio player found", file=sys.stderr)
+        print("lspeak-wyoming: aplay not found (install alsa-utils)", file=sys.stderr)
+        sys.exit(1)
 
 
 def main():

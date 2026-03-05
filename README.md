@@ -64,9 +64,13 @@ Accepts all lspeak flags for drop-in compatibility. Most are no-ops since Wyomin
 
 ## Requirements
 
-- Python 3.10+
-- `aplay` (ALSA utils) for audio playback on Linux
-- A running Wyoming TTS server
+- **Python 3.10+** (uses only stdlib — no pip dependencies)
+- **alsa-utils** for audio playback (`aplay`)
+  ```bash
+  # Debian/Ubuntu
+  sudo apt-get install -y alsa-utils
+  ```
+- A running [Wyoming TTS server](https://github.com/rhasspy/wyoming) (e.g., wyoming-xtts, wyoming-piper)
 
 ## License
 
