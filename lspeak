@@ -44,8 +44,37 @@ def build_wav(pcm_data: bytes, rate: int, width: int, channels: int) -> bytes:
     return header + pcm_data
 
 
+async def read_event(reader) -> tuple[dict, bytes] | None:
+    """Read one Wyoming protocol event: header line + data JSON + binary payload."""
+    import json
+
+    line = await asyncio.wait_for(reader.readline(), timeout=30.0)
+    if not line:
+        return None
+
+    header = json.loads(line)
+    data_length = header.get("data_length", 0)
+    payload_length = header.get("payload_length", 0)
+
+    # Read the data JSON (separate from header)
+    data = {}
+    if data_length > 0:
+        data_bytes = await reader.readexactly(data_length)
+        data = json.loads(data_bytes)
+
+    # Read binary payload (audio samples)
+    payload = b""
+    if payload_length > 0:
+        payload = await reader.readexactly(payload_length)
+
+    header["data"] = data
+    return header, payload
+
+
 async def synthesize(text: str) -> bytes | None:
     """Send text to Wyoming TTS server, return WAV bytes."""
+    import json
+
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(WYOMING_HOST, WYOMING_PORT),
@@ -55,17 +84,16 @@ async def synthesize(text: str) -> bytes | None:
         print(f"lspeak-wyoming: connection failed: {e}", file=sys.stderr)
         return None
 
-    # Wyoming protocol: newline-delimited JSON events
-    import json
-
-    # Send Synthesize event
-    event = {
+    # Send Synthesize event (Wyoming wire format: header\ndata)
+    data_obj = {"text": text, "voice": {"name": "jarvis"}}
+    data_bytes = json.dumps(data_obj).encode()
+    header = {
         "type": "synthesize",
-        "data": {"text": text, "voice": {"name": "jarvis"}},
-        "data_length": 0,
+        "version": "1.8.0",
+        "data_length": len(data_bytes),
         "payload_length": 0,
     }
-    writer.write((json.dumps(event) + "\n").encode())
+    writer.write(json.dumps(header).encode() + b"\n" + data_bytes)
     await writer.drain()
 
     # Read response events
@@ -76,23 +104,15 @@ async def synthesize(text: str) -> bytes | None:
 
     try:
         while True:
-            line = await asyncio.wait_for(reader.readline(), timeout=30.0)
-            if not line:
+            result = await read_event(reader)
+            if result is None:
                 break
 
-            evt = json.loads(line)
-            evt_type = evt.get("type", "")
-            payload_length = evt.get("payload_length", 0)
-
-            # Read binary payload if present
-            payload = b""
-            if payload_length > 0:
-                payload = await asyncio.wait_for(
-                    reader.readexactly(payload_length), timeout=30.0
-                )
+            header, payload = result
+            evt_type = header.get("type", "")
 
             if evt_type == "audio-start":
-                data = evt.get("data", {})
+                data = header.get("data", {})
                 rate = data.get("rate", rate)
                 width = data.get("width", width)
                 channels = data.get("channels", channels)
