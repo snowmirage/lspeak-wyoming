@@ -85,7 +85,7 @@ async def synthesize(text: str) -> bytes | None:
         return None
 
     # Send Synthesize event (Wyoming wire format: header\ndata)
-    data_obj = {"text": text, "voice": {"name": "jarvis"}}
+    data_obj = {"text": text, "voice": {"name": "jarvis"}, "language": "en"}
     data_bytes = json.dumps(data_obj).encode()
     header = {
         "type": "synthesize",
@@ -134,17 +134,36 @@ async def synthesize(text: str) -> bytes | None:
 
 
 def play_wav(wav_bytes: bytes):
-    """Play WAV audio via aplay (ALSA)."""
+    """Play WAV audio via Windows native audio (bypasses WSLg resampling)."""
+    import tempfile
+    import os
+
+    # Write WAV to Windows-accessible temp path
+    win_tmp = "/mnt/c/temp"
+    os.makedirs(win_tmp, exist_ok=True)
+    tmp_path = os.path.join(win_tmp, f"lspeak_{os.getpid()}.wav")
+    win_path = tmp_path.replace("/mnt/c/", "C:\\").replace("/", "\\")
+
     try:
-        proc = subprocess.Popen(
-            ["aplay", "-q", "-"],
-            stdin=subprocess.PIPE,
+        with open(tmp_path, "wb") as f:
+            f.write(wav_bytes)
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command",
+             f"(New-Object Media.SoundPlayer '{win_path}').PlaySync()"],
             stderr=subprocess.DEVNULL,
+            timeout=120,
         )
-        proc.communicate(input=wav_bytes)
     except FileNotFoundError:
-        print("lspeak-wyoming: aplay not found (install alsa-utils)", file=sys.stderr)
-        sys.exit(1)
+        print("lspeak-wyoming: powershell.exe not found, falling back to aplay", file=sys.stderr)
+        proc = subprocess.Popen(["aplay", "-q", "-"], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        proc.communicate(input=wav_bytes)
+    except subprocess.TimeoutExpired:
+        print("lspeak-wyoming: playback timed out", file=sys.stderr)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def main():
