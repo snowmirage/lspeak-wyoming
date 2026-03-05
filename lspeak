@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""lspeak-wyoming: Drop-in lspeak replacement using Wyoming XTTS.
+
+Accepts the same CLI interface as lspeak (--provider, --voice,
+--cache-threshold, --no-cache) but sends text to a Wyoming TTS
+server instead. Designed as a shim for Clarvis.
+
+Usage:
+    lspeak "Text to speak"
+    echo "Text to speak" | lspeak
+    lspeak -f file.txt
+"""
+
+import argparse
+import asyncio
+import io
+import struct
+import subprocess
+import sys
+
+
+WYOMING_HOST = "10.2.0.123"
+WYOMING_PORT = 10200
+
+
+def build_wav(pcm_data: bytes, rate: int, width: int, channels: int) -> bytes:
+    """Wrap raw PCM bytes in a WAV header."""
+    data_size = len(pcm_data)
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        36 + data_size,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,  # PCM
+        channels,
+        rate,
+        rate * channels * width,
+        channels * width,
+        width * 8,
+        b"data",
+        data_size,
+    )
+    return header + pcm_data
+
+
+async def synthesize(text: str) -> bytes | None:
+    """Send text to Wyoming TTS server, return WAV bytes."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(WYOMING_HOST, WYOMING_PORT),
+            timeout=5.0,
+        )
+    except (OSError, asyncio.TimeoutError) as e:
+        print(f"lspeak-wyoming: connection failed: {e}", file=sys.stderr)
+        return None
+
+    # Wyoming protocol: newline-delimited JSON events
+    import json
+
+    # Send Synthesize event
+    event = {
+        "type": "synthesize",
+        "data": {"text": text, "voice": {"name": "jarvis"}},
+        "data_length": 0,
+        "payload_length": 0,
+    }
+    writer.write((json.dumps(event) + "\n").encode())
+    await writer.drain()
+
+    # Read response events
+    rate = 22050
+    width = 2
+    channels = 1
+    pcm_chunks: list[bytes] = []
+
+    try:
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=30.0)
+            if not line:
+                break
+
+            evt = json.loads(line)
+            evt_type = evt.get("type", "")
+            payload_length = evt.get("payload_length", 0)
+
+            # Read binary payload if present
+            payload = b""
+            if payload_length > 0:
+                payload = await asyncio.wait_for(
+                    reader.readexactly(payload_length), timeout=30.0
+                )
+
+            if evt_type == "audio-start":
+                data = evt.get("data", {})
+                rate = data.get("rate", rate)
+                width = data.get("width", width)
+                channels = data.get("channels", channels)
+            elif evt_type == "audio-chunk":
+                if payload:
+                    pcm_chunks.append(payload)
+            elif evt_type == "audio-stop":
+                break
+    except asyncio.TimeoutError:
+        print("lspeak-wyoming: TTS timed out", file=sys.stderr)
+    finally:
+        writer.close()
+
+    if not pcm_chunks:
+        return None
+
+    pcm_data = b"".join(pcm_chunks)
+    return build_wav(pcm_data, rate, width, channels)
+
+
+def play_wav(wav_bytes: bytes):
+    """Play WAV audio using aplay (Linux) or available player."""
+    try:
+        proc = subprocess.Popen(
+            ["aplay", "-q", "-"],
+            stdin=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        proc.communicate(input=wav_bytes)
+    except FileNotFoundError:
+        # Fallback: write to temp file and use paplay/ffplay
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
+            f.write(wav_bytes)
+            f.flush()
+            for player in ["paplay", "ffplay -nodisp -autoexit"]:
+                try:
+                    subprocess.run(player.split() + [f.name], check=True,
+                                   stderr=subprocess.DEVNULL)
+                    return
+                except (FileNotFoundError, subprocess.CalledProcessError):
+                    continue
+        print("lspeak-wyoming: no audio player found", file=sys.stderr)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="lspeak-wyoming: Wyoming TTS drop-in for lspeak"
+    )
+    # lspeak-compatible arguments (accepted but mostly ignored)
+    parser.add_argument("text", nargs="*", help="Text to speak")
+    parser.add_argument("--provider", default="wyoming", help="(ignored) TTS provider")
+    parser.add_argument("--voice", "-v", default="jarvis", help="Voice name")
+    parser.add_argument("--no-cache", action="store_true", help="(ignored)")
+    parser.add_argument("--cache-threshold", type=float, help="(ignored)")
+    parser.add_argument("-f", "--file", help="Read text from file")
+    parser.add_argument("-o", "--output", help="Save WAV to file instead of playing")
+    parser.add_argument("--list-voices", action="store_true", help="(stub)")
+    parser.add_argument("--no-queue", action="store_true", help="(ignored)")
+    parser.add_argument("--queue-status", action="store_true", help="(stub)")
+    parser.add_argument("--daemon-status", action="store_true", help="(stub)")
+    parser.add_argument("--daemon-restart", action="store_true", help="(stub)")
+    parser.add_argument("--daemon-stop", action="store_true", help="(stub)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug output")
+
+    args = parser.parse_args()
+
+    # Handle stub commands
+    if args.list_voices:
+        print("jarvis (Wyoming XTTS, fine-tuned)")
+        return
+    if args.queue_status or args.daemon_status:
+        print("lspeak-wyoming: no daemon (direct mode)")
+        return
+    if args.daemon_restart or args.daemon_stop:
+        return
+
+    # Get text from arguments, file, or stdin
+    if args.file:
+        with open(args.file) as f:
+            text = f.read().strip()
+    elif args.text:
+        text = " ".join(args.text)
+    elif not sys.stdin.isatty():
+        text = sys.stdin.read().strip()
+    else:
+        print("lspeak-wyoming: no text provided", file=sys.stderr)
+        sys.exit(1)
+
+    if not text:
+        return
+
+    if args.debug:
+        print(f"lspeak-wyoming: speaking {len(text)} chars via {WYOMING_HOST}:{WYOMING_PORT}",
+              file=sys.stderr)
+
+    # Synthesize and play
+    wav_bytes = asyncio.run(synthesize(text))
+    if wav_bytes is None:
+        print("lspeak-wyoming: synthesis failed", file=sys.stderr)
+        sys.exit(1)
+
+    if args.output:
+        with open(args.output, "wb") as f:
+            f.write(wav_bytes)
+        if args.debug:
+            print(f"lspeak-wyoming: saved to {args.output}", file=sys.stderr)
+    else:
+        play_wav(wav_bytes)
+
+
+if __name__ == "__main__":
+    main()
