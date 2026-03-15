@@ -6,6 +6,7 @@ LABEL org.opencontainers.image.description="OpenAI-compatible TTS server bridgin
 RUN pip install --no-cache-dir fastapi uvicorn pydantic
 
 COPY lspeak-server /app/lspeak-server
+COPY preprocess.py /app/preprocess.py
 
 WORKDIR /app
 
