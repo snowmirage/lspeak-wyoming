@@ -3,6 +3,7 @@ FROM python:3.12-slim
 LABEL org.opencontainers.image.source=https://github.com/snowmirage/lspeak-wyoming
 LABEL org.opencontainers.image.description="OpenAI-compatible TTS server bridging to Wyoming XTTS"
 
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir fastapi uvicorn pydantic
 
 COPY lspeak-server /app/lspeak-server

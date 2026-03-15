@@ -202,6 +202,33 @@ async def synthesize(text: str, voice: str = "jarvis") -> bytes | None:
 
 
 # ─────────────────────────────────────────────
+# Audio format conversion
+# ─────────────────────────────────────────────
+
+_FORMAT_MAP = {
+    "mp3": ("audio/mpeg", ["-f", "mp3", "-codec:a", "libmp3lame", "-q:a", "2"]),
+    "opus": ("audio/opus", ["-f", "opus", "-codec:a", "libopus"]),
+    "aac": ("audio/aac", ["-f", "adts", "-codec:a", "aac"]),
+    "flac": ("audio/flac", ["-f", "flac", "-codec:a", "flac"]),
+}
+
+
+async def convert_audio(wav_bytes: bytes, fmt: str) -> tuple[bytes, str]:
+    """Convert WAV bytes to another format using ffmpeg."""
+    media_type, ffmpeg_args = _FORMAT_MAP[fmt]
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-i", "pipe:0", *ffmpeg_args, "-loglevel", "error", "pipe:1",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate(input=wav_bytes)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg exit {proc.returncode}: {stderr.decode(errors='replace')}")
+    return stdout, media_type
+
+
+# ─────────────────────────────────────────────
 # API endpoints
 # ─────────────────────────────────────────────
 
@@ -219,22 +246,32 @@ async def create_speech(request: SpeechRequest):
     if not normalized.strip():
         raise HTTPException(status_code=400, detail="Input text is empty after normalization")
 
-    # Synthesize via Wyoming XTTS
+    # Synthesize via Wyoming XTTS (always returns WAV/PCM)
     wav_bytes = await synthesize(normalized, request.voice)
     t_synth = time.monotonic()
 
+    # Convert to requested format if needed
+    output_bytes = wav_bytes
+    media_type = "audio/wav"
+    fmt = request.response_format.lower()
+    if fmt in ("mp3", "opus", "aac", "flac"):
+        try:
+            output_bytes, media_type = await convert_audio(wav_bytes, fmt)
+        except Exception as e:
+            logger.warning("Audio conversion to %s failed (%s), returning WAV", fmt, e)
+
     norm_ms = (t_norm - t0) * 1000
     synth_ms = (t_synth - t_norm) * 1000
-    total_ms = (t_synth - t0) * 1000
+    total_ms = (time.monotonic() - t0) * 1000
 
     logger.info(
-        "TTS: norm=%.0fms synth=%.0fms total=%.0fms chars=%d voice=%s",
-        norm_ms, synth_ms, total_ms, len(normalized), request.voice,
+        "TTS: norm=%.0fms synth=%.0fms total=%.0fms chars=%d voice=%s fmt=%s",
+        norm_ms, synth_ms, total_ms, len(normalized), request.voice, fmt,
     )
 
     return Response(
-        content=wav_bytes,
-        media_type="audio/wav",
+        content=output_bytes,
+        media_type=media_type,
         headers={
             "X-TTS-Normalize-Ms": f"{norm_ms:.0f}",
             "X-TTS-Synthesize-Ms": f"{synth_ms:.0f}",
