@@ -105,9 +105,87 @@ def strip_markdown(text: str) -> str:
     return text.strip()
 
 
+# ─────────────────────────────────────────────
+# Custom abbreviation expansion (project-specific terms)
+# ─────────────────────────────────────────────
+
+# Whole-word abbreviations that should be spelled out (case-sensitive)
+_SPELL_OUT = {
+    "HA": "H A",
+    "XTTS": "X T T S",
+    "TTS": "T T S",
+    "STT": "S T T",
+    "API": "A P I",
+    "APIs": "A P Is",
+    "SSH": "S S H",
+    "DNS": "D N S",
+    "JWT": "J W T",
+    "URL": "U R L",
+    "URLs": "U R Ls",
+    "HTTP": "H T T P",
+    "HTTPS": "H T T P S",
+    "HTML": "H T M L",
+    "CSS": "C S S",
+    "CLI": "C L I",
+    "GPU": "G P U",
+    "GPUs": "G P Us",
+    "CPU": "C P U",
+    "LLM": "L L M",
+    "LLMs": "L L Ms",
+    "VRAM": "V RAM",
+    "HACS": "H A C S",
+    "YAML": "YAML",
+    "JSON": "JSON",
+    "JSONL": "JSON L",
+    "WSL": "W S L",
+    "NAS": "NAS",
+    "VLAN": "V LAN",
+    "IP": "I P",
+    "TCP": "T C P",
+    "PR": "P R",
+    "PRs": "P Rs",
+    "UI": "U I",
+    "MQTT": "M Q T T",
+    "OAI": "O A I",
+    "CUDA": "CUDA",
+    "XTTS": "X T T S",
+}
+
+# Compound terms that need word-boundary-aware replacement
+_COMPOUND_TERMS = [
+    (re.compile(r'\blspeak-server\b', re.IGNORECASE), "L speak server"),
+    (re.compile(r'\blspeak\b', re.IGNORECASE), "L speak"),
+    (re.compile(r'\bWebUI\b'), "Web U I"),
+    (re.compile(r'\bOpenClaw\b'), "Open Claw"),
+    (re.compile(r'\bwyoming-xtts\b', re.IGNORECASE), "Wyoming X T T S"),
+    (re.compile(r'\bdevenv\b', re.IGNORECASE), "dev env"),
+    (re.compile(r'\bKittenTTS\b'), "Kitten T T S"),
+    (re.compile(r'\bllama\.cpp\b'), "llama C P P"),
+    (re.compile(r'\bllama-server\b'), "llama server"),
+    (re.compile(r'\bESPHome\b'), "E S P Home"),
+    (re.compile(r'\bClarvis\b'), "Clarvis"),
+]
+
+# Build regex for whole-word spell-out (longest match first to avoid partial)
+_SPELL_OUT_RE = re.compile(
+    r'\b(' + '|'.join(sorted(_SPELL_OUT.keys(), key=len, reverse=True)) + r')\b'
+)
+
+
+def expand_custom_abbreviations(text: str) -> str:
+    """Expand project-specific abbreviations and compound terms."""
+    # Compound terms first (more specific patterns)
+    for pattern, replacement in _COMPOUND_TERMS:
+        text = pattern.sub(replacement, text)
+    # Whole-word spell-outs (case-sensitive)
+    text = _SPELL_OUT_RE.sub(lambda m: _SPELL_OUT[m.group(1)], text)
+    return text
+
+
 def normalize_for_speech(text: str) -> str:
-    """Full normalization pipeline: markdown strip → KittenTTS."""
+    """Full normalization pipeline: markdown strip → custom abbrevs → KittenTTS."""
     text = strip_markdown(text)
+    text = expand_custom_abbreviations(text)
     text = _preprocessor(text)
     return text
 
