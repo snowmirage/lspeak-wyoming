@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""lspeak-wyoming: Drop-in lspeak replacement using Wyoming XTTS.
+"""lspeak: TTS client that routes through lspeak-server.
 
-Accepts the same CLI interface as lspeak (--provider, --voice,
---cache-threshold, --no-cache) but sends text to a Wyoming TTS
-server instead. Designed as a shim for Clarvis.
+Sends text to lspeak-server (OpenAI-compatible TTS HTTP endpoint) which
+handles text normalization (KittenTTS + markdown stripping) and Wyoming
+XTTS synthesis. Returns WAV audio for playback.
 
 Usage:
     lspeak "Text to speak"
@@ -12,132 +12,48 @@ Usage:
 """
 
 import argparse
-import asyncio
-import struct
+import json
+import os
 import subprocess
 import sys
+import urllib.request
+import urllib.error
 
 
-WYOMING_HOST = "10.2.0.123"
-WYOMING_PORT = 10200
+LSPEAK_SERVER = os.getenv("LSPEAK_SERVER", "http://10.2.0.16:8820")
 
 
-def build_wav(pcm_data: bytes, rate: int, width: int, channels: int) -> bytes:
-    """Wrap raw PCM bytes in a WAV header."""
-    data_size = len(pcm_data)
-    header = struct.pack(
-        "<4sI4s4sIHHIIHH4sI",
-        b"RIFF",
-        36 + data_size,
-        b"WAVE",
-        b"fmt ",
-        16,
-        1,  # PCM
-        channels,
-        rate,
-        rate * channels * width,
-        channels * width,
-        width * 8,
-        b"data",
-        data_size,
+def synthesize(text: str, voice: str = "jarvis") -> bytes | None:
+    """Send text to lspeak-server, return WAV bytes."""
+    url = f"{LSPEAK_SERVER}/v1/audio/speech"
+    payload = json.dumps({
+        "input": text,
+        "voice": voice,
+        "model": "xtts",
+        "response_format": "wav",
+    }).encode()
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
-    return header + pcm_data
-
-
-async def read_event(reader) -> tuple[dict, bytes] | None:
-    """Read one Wyoming protocol event: header line + data JSON + binary payload."""
-    import json
-
-    line = await asyncio.wait_for(reader.readline(), timeout=30.0)
-    if not line:
-        return None
-
-    header = json.loads(line)
-    data_length = header.get("data_length", 0)
-    payload_length = header.get("payload_length", 0)
-
-    # Read the data JSON (separate from header)
-    data = {}
-    if data_length > 0:
-        data_bytes = await reader.readexactly(data_length)
-        data = json.loads(data_bytes)
-
-    # Read binary payload (audio samples)
-    payload = b""
-    if payload_length > 0:
-        payload = await reader.readexactly(payload_length)
-
-    header["data"] = data
-    return header, payload
-
-
-async def synthesize(text: str) -> bytes | None:
-    """Send text to Wyoming TTS server, return WAV bytes."""
-    import json
 
     try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(WYOMING_HOST, WYOMING_PORT),
-            timeout=5.0,
-        )
-    except (OSError, asyncio.TimeoutError) as e:
-        print(f"lspeak-wyoming: connection failed: {e}", file=sys.stderr)
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        print(f"lspeak: server error {e.code}: {body}", file=sys.stderr)
         return None
-
-    # Send Synthesize event (Wyoming wire format: header\ndata)
-    data_obj = {"text": text, "voice": {"name": "jarvis"}, "language": "en"}
-    data_bytes = json.dumps(data_obj).encode()
-    header = {
-        "type": "synthesize",
-        "version": "1.8.0",
-        "data_length": len(data_bytes),
-        "payload_length": 0,
-    }
-    writer.write(json.dumps(header).encode() + b"\n" + data_bytes)
-    await writer.drain()
-
-    # Read response events
-    rate = 22050
-    width = 2
-    channels = 1
-    pcm_chunks: list[bytes] = []
-
-    try:
-        while True:
-            result = await read_event(reader)
-            if result is None:
-                break
-
-            header, payload = result
-            evt_type = header.get("type", "")
-
-            if evt_type == "audio-start":
-                data = header.get("data", {})
-                rate = data.get("rate", rate)
-                width = data.get("width", width)
-                channels = data.get("channels", channels)
-            elif evt_type == "audio-chunk":
-                if payload:
-                    pcm_chunks.append(payload)
-            elif evt_type == "audio-stop":
-                break
-    except asyncio.TimeoutError:
-        print("lspeak-wyoming: TTS timed out", file=sys.stderr)
-    finally:
-        writer.close()
-
-    if not pcm_chunks:
+    except (urllib.error.URLError, OSError) as e:
+        print(f"lspeak: connection failed: {e}", file=sys.stderr)
         return None
-
-    pcm_data = b"".join(pcm_chunks)
-    return build_wav(pcm_data, rate, width, channels)
 
 
 def play_wav(wav_bytes: bytes):
     """Play WAV audio via Windows native audio (bypasses WSLg resampling)."""
-    import tempfile
-    import os
-
     # Write WAV to Windows-accessible temp path
     win_tmp = "/mnt/c/temp"
     os.makedirs(win_tmp, exist_ok=True)
@@ -154,11 +70,11 @@ def play_wav(wav_bytes: bytes):
             timeout=120,
         )
     except FileNotFoundError:
-        print("lspeak-wyoming: powershell.exe not found, falling back to aplay", file=sys.stderr)
+        print("lspeak: powershell.exe not found, falling back to aplay", file=sys.stderr)
         proc = subprocess.Popen(["aplay", "-q", "-"], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
         proc.communicate(input=wav_bytes)
     except subprocess.TimeoutExpired:
-        print("lspeak-wyoming: playback timed out", file=sys.stderr)
+        print("lspeak: playback timed out", file=sys.stderr)
     finally:
         try:
             os.unlink(tmp_path)
@@ -167,35 +83,33 @@ def play_wav(wav_bytes: bytes):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="lspeak-wyoming: Wyoming TTS drop-in for lspeak"
-    )
-    # lspeak-compatible arguments (accepted but mostly ignored)
+    parser = argparse.ArgumentParser(description="lspeak: TTS via lspeak-server")
     parser.add_argument("text", nargs="*", help="Text to speak")
-    parser.add_argument("--provider", default="wyoming", help="(ignored) TTS provider")
     parser.add_argument("--voice", "-v", default="jarvis", help="Voice name")
-    parser.add_argument("--no-cache", action="store_true", help="(ignored)")
-    parser.add_argument("--cache-threshold", type=float, help="(ignored)")
     parser.add_argument("-f", "--file", help="Read text from file")
     parser.add_argument("-o", "--output", help="Save WAV to file instead of playing")
-    parser.add_argument("--list-voices", action="store_true", help="(stub)")
-    parser.add_argument("--no-queue", action="store_true", help="(ignored)")
-    parser.add_argument("--queue-status", action="store_true", help="(stub)")
-    parser.add_argument("--daemon-status", action="store_true", help="(stub)")
-    parser.add_argument("--daemon-restart", action="store_true", help="(stub)")
-    parser.add_argument("--daemon-stop", action="store_true", help="(stub)")
+    parser.add_argument("--list-voices", action="store_true", help="List available voices")
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
+    # Legacy args (accepted but ignored for backwards compatibility)
+    parser.add_argument("--provider", default="lspeak-server", help=argparse.SUPPRESS)
+    parser.add_argument("--no-cache", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--cache-threshold", type=float, help=argparse.SUPPRESS)
+    parser.add_argument("--no-queue", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--queue-status", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--daemon-status", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--daemon-restart", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--daemon-stop", action="store_true", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
-    # Handle stub commands
     if args.list_voices:
-        print("jarvis (Wyoming XTTS, fine-tuned)")
-        return
-    if args.queue_status or args.daemon_status:
-        print("lspeak-wyoming: no daemon (direct mode)")
-        return
-    if args.daemon_restart or args.daemon_stop:
+        try:
+            with urllib.request.urlopen(f"{LSPEAK_SERVER}/v1/audio/speech/voices", timeout=5) as resp:
+                data = json.loads(resp.read())
+                for v in data.get("voices", []):
+                    print(f"{v['name']} — {v.get('description', '')}")
+        except Exception:
+            print("jarvis — XTTS v2 fine-tuned Jarvis")
         return
 
     # Get text from arguments, file, or stdin
@@ -207,27 +121,25 @@ def main():
     elif not sys.stdin.isatty():
         text = sys.stdin.read().strip()
     else:
-        print("lspeak-wyoming: no text provided", file=sys.stderr)
+        print("lspeak: no text provided", file=sys.stderr)
         sys.exit(1)
 
     if not text:
         return
 
     if args.debug:
-        print(f"lspeak-wyoming: speaking {len(text)} chars via {WYOMING_HOST}:{WYOMING_PORT}",
-              file=sys.stderr)
+        print(f"lspeak: speaking {len(text)} chars via {LSPEAK_SERVER}", file=sys.stderr)
 
-    # Synthesize and play
-    wav_bytes = asyncio.run(synthesize(text))
+    wav_bytes = synthesize(text, args.voice)
     if wav_bytes is None:
-        print("lspeak-wyoming: synthesis failed", file=sys.stderr)
+        print("lspeak: synthesis failed", file=sys.stderr)
         sys.exit(1)
 
     if args.output:
         with open(args.output, "wb") as f:
             f.write(wav_bytes)
         if args.debug:
-            print(f"lspeak-wyoming: saved to {args.output}", file=sys.stderr)
+            print(f"lspeak: saved to {args.output}", file=sys.stderr)
     else:
         play_wav(wav_bytes)
 
