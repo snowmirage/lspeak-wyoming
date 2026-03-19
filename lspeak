@@ -20,7 +20,7 @@ import urllib.request
 import urllib.error
 
 
-LSPEAK_SERVER = os.getenv("LSPEAK_SERVER", "http://10.2.0.16:8820")
+LSPEAK_SERVER = os.getenv("LSPEAK_SERVER", "http://10.2.0.125:8820")
 
 
 def synthesize(text: str, voice: str = "jarvis") -> bytes | None:
